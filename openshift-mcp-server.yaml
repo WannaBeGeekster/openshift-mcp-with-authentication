@@ -1,0 +1,132 @@
+# OpenShift MCP Server: per-user OAuth passthrough deployment.
+# Replace MCP_HOST (for example mcp.apps.<cluster-domain>) before applying; see README.md.
+# Tested on OpenShift 4.22 with the Red Hat tech preview image 0.4.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-mcp-server
+---
+# The server calls the Kubernetes API with each caller's own token (cluster_auth_mode
+# passthrough), so this ServiceAccount needs no cluster permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp-server
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-mcp-server-config
+  namespace: openshift-mcp-server
+data:
+  config.toml: |
+    port = "8080"
+    server_url = "https://MCP_HOST"
+    certificate_authority = "/etc/pki/openshift-mcp-server/ca-bundle.crt"
+    # OAuth: reject requests without "Authorization: Bearer <token>" (HTTP 401).
+    require_oauth = true
+    # OpenShift OAuth tokens (sha256~...) are opaque, not JWTs: do not try to validate them here.
+    skip_jwt_verification = true
+    # Call the Kubernetes API as the caller: the API server authenticates the token and
+    # applies that user's own RBAC. (Image 0.4 refuses require_oauth with "kubeconfig".)
+    cluster_auth_mode = "passthrough"
+    read_only = true
+    disable_destructive = true
+    toolsets = ["core","config","openshift"]
+---
+# The cluster injects its trusted CA bundle into this ConfigMap (key ca-bundle.crt).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-mcp-server-trusted-ca
+  namespace: openshift-mcp-server
+  labels:
+    config.openshift.io/inject-trusted-cabundle: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp-server
+  labels:
+    app.kubernetes.io/name: openshift-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openshift-mcp-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openshift-mcp-server
+    spec:
+      serviceAccountName: openshift-mcp-server
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: openshift-mcp-server
+          image: registry.redhat.io/openshift-mcp-tech-preview/openshift-mcp-server-rhel9@sha256:855466299c3178f7d9f96a1511005ca6161b8cc6b294df9907c234ce8ecfd0f2
+          args: ["--config", "/etc/openshift-mcp-server/config.toml"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openshift-mcp-server
+              readOnly: true
+            - name: trusted-ca
+              mountPath: /etc/pki/openshift-mcp-server
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: openshift-mcp-server-config
+        - name: trusted-ca
+          configMap:
+            name: openshift-mcp-server-trusted-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp-server
+spec:
+  selector:
+    app.kubernetes.io/name: openshift-mcp-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: openshift-mcp-server
+  namespace: openshift-mcp-server
+spec:
+  host: MCP_HOST
+  to:
+    kind: Service
+    name: openshift-mcp-server
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
